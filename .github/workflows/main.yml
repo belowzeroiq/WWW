@@ -1,0 +1,629 @@
+name: Xiaomi ROM Auto Porter with RomTools
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_device:
+        description: 'Source device codename (e.g., topaz, veux)'
+        required: true
+        type: string
+      target_device:
+        description: 'Target device codename'
+        required: true
+        type: string
+      rom_url:
+        description: 'Direct ROM download URL (leave empty for auto-fetch)'
+        required: false
+        type: string
+      rom_type:
+        description: 'ROM type'
+        required: true
+        type: choice
+        options:
+          - 'Global'
+          - 'China'
+          - 'EEA'
+          - 'Indonesia'
+      base_rom_url:
+        description: 'Base ROM URL for target device'
+        required: true
+        type: string
+
+env:
+  WORKDIR: /tmp/rom_workdir
+  OUTPUT_DIR: /tmp/output
+  INPUT_DIR: /tmp/input
+
+jobs:
+  setup-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      rom_download_url: ${{ steps.fetch_rom.outputs.url }}
+      rom_version: ${{ steps.fetch_rom.outputs.version }}
+    
+    steps:
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget aria2 curl git \
+            python3-pip python3-dev \
+            openjdk-17-jdk \
+            unzip zip p7zip-full \
+            brotli lz4 zstd \
+            android-sdk-libsparse-utils \
+            e2fsprogs erofs-utils f2fs-tools \
+            img2simg simg2img \
+            device-tree-compiler \
+            libprotobuf-dev protobuf-compiler \
+            android-tools-adb android-tools-fastboot
+
+      - name: Install Python dependencies
+        run: |
+          pip3 install --upgrade pip
+          pip3 install requests beautifulsoup4 protobuf pycryptodome
+
+      - name: Clone RomTools
+        run: |
+          git clone https://github.com/Danda420/RomTools.git
+          cd RomTools
+          chmod +x start
+          # Auto-install dependencies
+          echo "1" | bash start || true
+
+      - name: Fetch ROM download URL
+        id: fetch_rom
+        if: ${{ github.event.inputs.rom_url == '' }}
+        run: |
+          python3 << 'EOF'
+          import requests
+          import json
+          import os
+          import re
+          
+          device = "${{ github.event.inputs.source_device }}"
+          rom_type = "${{ github.event.inputs.rom_type }}"
+          
+          # Xiaomi Firmware Updater API
+          api_urls = [
+              f"https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/data/latest.yml",
+              f"https://xiaomifirmwareupdater.com/miui/{device}/"
+          ]
+          
+          try:
+              # Try XiaomiFirmwareUpdater API
+              response = requests.get(f"https://raw.githubusercontent.com/XiaomiFirmwareUpdater/miui-updates-tracker/master/data/devices/{device}.yml")
+              
+              if response.status_code == 200:
+                  content = response.text
+                  # Parse YAML-like content for latest ROM
+                  lines = content.split('\n')
+                  latest_url = None
+                  latest_version = None
+                  
+                  for i, line in enumerate(lines):
+                      if rom_type.lower() in line.lower() and 'download' in lines[i+1].lower():
+                          latest_url = lines[i+1].split(':', 1)[1].strip()
+                          latest_version = re.search(r'V[\d.]+', latest_url)
+                          if latest_version:
+                              latest_version = latest_version.group()
+                          break
+                  
+                  if latest_url:
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"url={latest_url}\n")
+                          f.write(f"version={latest_version or 'latest'}\n")
+                      print(f"Found ROM: {latest_url}")
+                  else:
+                      print("ROM not found, using manual URL")
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"url=${{ github.event.inputs.rom_url }}\n")
+                          f.write(f"version=manual\n")
+              else:
+                  print("API failed, using manual URL")
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                      f.write(f"url=${{ github.event.inputs.rom_url }}\n")
+                      f.write(f"version=manual\n")
+                      
+          except Exception as e:
+              print(f"Error: {e}")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write(f"url=${{ github.event.inputs.rom_url }}\n")
+                  f.write(f"version=manual\n")
+          EOF
+
+      - name: Cache RomTools setup
+        uses: actions/cache@v4
+        with:
+          path: |
+            RomTools/tool
+            RomTools/bin
+          key: romtools-${{ runner.os }}-${{ hashFiles('RomTools/**') }}
+
+  download-roms:
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create directories
+        run: |
+          mkdir -p ${{ env.INPUT_DIR }}/{source,base}
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          mkdir -p ${{ env.WORKDIR }}
+
+      - name: Download source ROM
+        run: |
+          ROM_URL="${{ github.event.inputs.rom_url }}"
+          if [ -z "$ROM_URL" ]; then
+            ROM_URL="${{ needs.setup-environment.outputs.rom_download_url }}"
+          fi
+          
+          echo "Downloading from: $ROM_URL"
+          aria2c -x 16 -s 16 -k 1M \
+            --max-connection-per-server=16 \
+            --min-split-size=1M \
+            -d ${{ env.INPUT_DIR }}/source \
+            -o source_rom.zip \
+            "$ROM_URL"
+
+      - name: Download base ROM
+        run: |
+          echo "Downloading base ROM for ${{ github.event.inputs.target_device }}"
+          aria2c -x 16 -s 16 -k 1M \
+            --max-connection-per-server=16 \
+            --min-split-size=1M \
+            -d ${{ env.INPUT_DIR }}/base \
+            -o base_rom.zip \
+            "${{ github.event.inputs.base_rom_url }}"
+
+      - name: Upload ROM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-roms
+          path: ${{ env.INPUT_DIR }}
+          retention-days: 1
+          compression-level: 0
+
+  extract-and-port:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, download-roms]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python3-pip unzip zip \
+            brotli lz4 zstd p7zip-full \
+            android-sdk-libsparse-utils \
+            e2fsprogs erofs-utils f2fs-tools \
+            img2simg simg2img \
+            device-tree-compiler \
+            libprotobuf-dev protobuf-compiler
+          
+          pip3 install protobuf pycryptodome
+
+      - name: Clone and setup RomTools
+        run: |
+          git clone https://github.com/Danda420/RomTools.git
+          cd RomTools
+          chmod +x start
+          # Create necessary directories
+          mkdir -p input output ROM_WORKDIR
+
+      - name: Download ROM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: downloaded-roms
+          path: ${{ env.INPUT_DIR }}
+
+      - name: Extract payload from source ROM
+        run: |
+          cd RomTools
+          
+          # Copy source ROM to input
+          cp ${{ env.INPUT_DIR }}/source/source_rom.zip input/
+          
+          # Extract payload.bin from ZIP
+          unzip -j input/source_rom.zip payload.bin -d input/ || \
+          7z e input/source_rom.zip payload.bin -oinput/ || \
+          echo "Payload already available or using different format"
+
+      - name: Extract source ROM partitions
+        run: |
+          cd RomTools
+          
+          # Use payload-dumper or similar tool
+          python3 << 'EOF'
+          import sys
+          import os
+          sys.path.insert(0, 'tool')
+          
+          # Import RomTools functions
+          from functions import *
+          
+          # Extract payload.bin
+          payload_file = "input/payload.bin"
+          if os.path.exists(payload_file):
+              print("Extracting payload.bin...")
+              extract_payload(payload_file, "ROM_WORKDIR/source")
+          else:
+              # Try extracting OTA zip directly
+              print("Extracting OTA zip...")
+              extract_ota("input/source_rom.zip", "ROM_WORKDIR/source")
+          EOF
+
+      - name: Extract base ROM partitions
+        run: |
+          cd RomTools
+          
+          # Copy base ROM to input
+          cp ${{ env.INPUT_DIR }}/base/base_rom.zip input/base_rom.zip
+          
+          # Extract base ROM
+          python3 << 'EOF'
+          import sys
+          import os
+          sys.path.insert(0, 'tool')
+          from functions import *
+          
+          payload_file = "input/base_rom.zip"
+          if os.path.exists(payload_file):
+              print("Extracting base ROM...")
+              extract_ota(payload_file, "ROM_WORKDIR/base")
+          EOF
+
+      - name: Convert and extract images
+        run: |
+          cd RomTools/ROM_WORKDIR
+          
+          # Convert EROFS/F2FS to EXT4 for easier modification
+          for partition in system system_ext product vendor; do
+            if [ -f "source/${partition}.img" ]; then
+              echo "Processing source ${partition}.img..."
+              
+              # Detect format and convert if needed
+              file_type=$(file "source/${partition}.img")
+              
+              if [[ $file_type == *"EROFS"* ]]; then
+                echo "Converting ${partition} from EROFS to EXT4..."
+                python3 ../tool/erofs_to_ext4.py \
+                  "source/${partition}.img" \
+                  "source/${partition}_ext4.img" || true
+                mv "source/${partition}_ext4.img" "source/${partition}.img" || true
+              fi
+              
+              # Mount and extract
+              mkdir -p "source/${partition}_mount"
+              sudo mount -o loop "source/${partition}.img" "source/${partition}_mount" 2>/dev/null || \
+              python3 ../tool/extract_image.py "source/${partition}.img" "source/${partition}_mount"
+            fi
+          done
+          
+          # Extract base ROM partitions
+          for partition in vendor boot vendor_boot dtbo; do
+            if [ -f "base/${partition}.img" ]; then
+              echo "Processing base ${partition}.img..."
+              mkdir -p "base/${partition}_mount"
+              sudo mount -o loop "base/${partition}.img" "base/${partition}_mount" 2>/dev/null || \
+              python3 ../tool/extract_image.py "base/${partition}.img" "base/${partition}_mount"
+            fi
+          done
+
+      - name: Port ROM - Replace hardware-specific files
+        run: |
+          cd RomTools/ROM_WORKDIR
+          
+          mkdir -p ported
+          
+          # Copy source ROM system partitions
+          echo "Copying system partitions from source ROM..."
+          for partition in system system_ext product; do
+            if [ -d "source/${partition}_mount" ]; then
+              cp -r "source/${partition}_mount" "ported/${partition}"
+            fi
+          done
+          
+          # Use base ROM vendor (hardware-specific)
+          echo "Using base ROM vendor partition..."
+          if [ -d "base/vendor_mount" ]; then
+            cp -r "base/vendor_mount" "ported/vendor"
+          fi
+          
+          # Replace hardware-specific libraries
+          echo "Replacing hardware libraries..."
+          if [ -d "ported/system/lib/hw" ] && [ -d "base/vendor_mount/lib/hw" ]; then
+            cp -rf base/vendor_mount/lib/hw/* ported/system/lib/hw/ 2>/dev/null || true
+            cp -rf base/vendor_mount/lib64/hw/* ported/system/lib64/hw/ 2>/dev/null || true
+          fi
+          
+          # Copy firmware
+          if [ -d "base/vendor_mount/firmware" ]; then
+            mkdir -p ported/vendor/firmware
+            cp -rf base/vendor_mount/firmware/* ported/vendor/firmware/
+          fi
+
+      - name: Port ROM - Modify boot image
+        run: |
+          cd RomTools
+          
+          # Use boot image porting script
+          python3 << 'EOF'
+          import os
+          import shutil
+          import subprocess
+          
+          # Extract source boot
+          if os.path.exists("ROM_WORKDIR/source/boot.img"):
+              subprocess.run(["python3", "tool/unpack_bootimg.py", 
+                            "ROM_WORKDIR/source/boot.img", 
+                            "ROM_WORKDIR/source/boot_unpacked"])
+          
+          # Extract base boot
+          if os.path.exists("ROM_WORKDIR/base/boot.img"):
+              subprocess.run(["python3", "tool/unpack_bootimg.py",
+                            "ROM_WORKDIR/base/boot.img",
+                            "ROM_WORKDIR/base/boot_unpacked"])
+          
+          # Replace kernel with base kernel
+          if os.path.exists("ROM_WORKDIR/base/boot_unpacked/kernel"):
+              shutil.copy("ROM_WORKDIR/base/boot_unpacked/kernel",
+                         "ROM_WORKDIR/source/boot_unpacked/kernel")
+          
+          # Merge ramdisk - keep source ROM's ramdisk but add base device-specific init
+          if os.path.exists("ROM_WORKDIR/base/boot_unpacked/ramdisk"):
+              # Copy device-specific init files
+              target_device = "${{ github.event.inputs.target_device }}"
+              init_rc = f"ROM_WORKDIR/base/boot_unpacked/ramdisk/init.{target_device}.rc"
+              if os.path.exists(init_rc):
+                  shutil.copy(init_rc, 
+                            f"ROM_WORKDIR/source/boot_unpacked/ramdisk/init.{target_device}.rc")
+          
+          # Repack boot
+          subprocess.run(["python3", "tool/repack_bootimg.py",
+                        "ROM_WORKDIR/source/boot_unpacked",
+                        "ROM_WORKDIR/ported/boot.img"])
+          
+          print("Boot image ported successfully")
+          EOF
+
+      - name: Modify build properties
+        run: |
+          cd RomTools/ROM_WORKDIR/ported
+          
+          TARGET_DEVICE="${{ github.event.inputs.target_device }}"
+          
+          # Modify build.prop files
+          for build_prop in system/build.prop product/build.prop system/system/build.prop; do
+            if [ -f "$build_prop" ]; then
+              echo "Modifying $build_prop..."
+              
+              sed -i "s/ro.product.device=.*/ro.product.device=${TARGET_DEVICE}/g" "$build_prop"
+              sed -i "s/ro.build.product=.*/ro.build.product=${TARGET_DEVICE}/g" "$build_prop"
+              sed -i "s/ro.product.model=.*/ro.product.model=${TARGET_DEVICE}/g" "$build_prop"
+              sed -i "s/ro.product.name=.*/ro.product.name=${TARGET_DEVICE}/g" "$build_prop"
+            fi
+          done
+
+      - name: Create partition images
+        run: |
+          cd RomTools
+          
+          # Create EXT4 images from directories
+          python3 << 'EOF'
+          import subprocess
+          import os
+          
+          partitions = ['system', 'system_ext', 'product', 'vendor']
+          
+          for partition in partitions:
+              part_dir = f"ROM_WORKDIR/ported/{partition}"
+              part_img = f"output/{partition}.img"
+              
+              if os.path.exists(part_dir):
+                  print(f"Creating {partition}.img...")
+                  
+                  # Calculate size
+                  size_cmd = f"du -sb {part_dir} | cut -f1"
+                  size = int(subprocess.check_output(size_cmd, shell=True).decode().strip())
+                  size = int(size * 1.1)  # Add 10% overhead
+                  
+                  # Create ext4 image
+                  subprocess.run([
+                      "python3", "tool/make_ext4fs.py",
+                      "-l", str(size),
+                      "-a", partition,
+                      part_img,
+                      part_dir
+                  ])
+                  
+                  print(f"{partition}.img created successfully")
+          EOF
+          
+          # Copy boot image
+          cp ROM_WORKDIR/ported/boot.img output/
+
+      - name: Create flashable package
+        run: |
+          cd RomTools/output
+          
+          # Create META-INF structure
+          mkdir -p META-INF/com/google/android
+          
+          # Create updater-script
+          cat > META-INF/com/google/android/updater-script << 'EOF'
+          ui_print("================================");
+          ui_print("  Ported MIUI ROM Installer");
+          ui_print("  Target: ${{ github.event.inputs.target_device }}");
+          ui_print("================================");
+          
+          ui_print("Mounting partitions...");
+          mount("ext4", "EMMC", "/dev/block/bootdevice/by-name/system", "/system");
+          mount("ext4", "EMMC", "/dev/block/bootdevice/by-name/vendor", "/vendor");
+          mount("ext4", "EMMC", "/dev/block/bootdevice/by-name/product", "/product");
+          
+          ui_print("Flashing system...");
+          package_extract_file("system.img", "/dev/block/bootdevice/by-name/system");
+          
+          ui_print("Flashing vendor...");
+          package_extract_file("vendor.img", "/dev/block/bootdevice/by-name/vendor");
+          
+          ui_print("Flashing product...");
+          package_extract_file("product.img", "/dev/block/bootdevice/by-name/product");
+          
+          ui_print("Flashing system_ext...");
+          package_extract_file("system_ext.img", "/dev/block/bootdevice/by-name/system_ext");
+          
+          ui_print("Flashing boot...");
+          package_extract_file("boot.img", "/dev/block/bootdevice/by-name/boot");
+          
+          ui_print("Unmounting partitions...");
+          unmount("/system");
+          unmount("/vendor");
+          unmount("/product");
+          
+          ui_print("Installation complete!");
+          ui_print("Reboot to enjoy your ported ROM!");
+          EOF
+          
+          # Create update-binary (using standard recovery binary)
+          cat > META-INF/com/google/android/update-binary << 'EOF'
+          #!/sbin/sh
+          OUTFD=$2
+          ZIP=$3
+          
+          ui_print() {
+            echo "ui_print $1" > /proc/self/fd/$OUTFD
+            echo "ui_print" > /proc/self/fd/$OUTFD
+          }
+          
+          cd /tmp
+          mkdir -p /tmp/install
+          cd /tmp/install
+          unzip -o "$ZIP"
+          
+          sh META-INF/com/google/android/updater-script
+          EOF
+          
+          chmod +x META-INF/com/google/android/update-binary
+          chmod +x META-INF/com/google/android/updater-script
+          
+          # Package everything
+          ROM_VERSION="${{ needs.setup-environment.outputs.rom_version }}"
+          TARGET="${{ github.event.inputs.target_device }}"
+          ZIP_NAME="MIUI_${TARGET}_${ROM_VERSION}_Ported_$(date +%Y%m%d).zip"
+          
+          zip -r9 "$ZIP_NAME" \
+            *.img \
+            META-INF/
+          
+          # Calculate checksums
+          sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
+          md5sum "$ZIP_NAME" > "${ZIP_NAME}.md5"
+          
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload ported ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: ported-rom
+          path: RomTools/output/*.zip*
+          retention-days: 7
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [setup-environment, extract-and-port]
+    if: success()
+    
+    steps:
+      - name: Download ported ROM
+        uses: actions/download-artifact@v4
+        with:
+          name: ported-rom
+          path: release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.target_device }}-${{ needs.setup-environment.outputs.rom_version }}-${{ github.run_number }}
+          name: "MIUI ROM for ${{ github.event.inputs.target_device }} - ${{ needs.setup-environment.outputs.rom_version }}"
+          body: |
+            ## 📱 Ported MIUI ROM
+            
+            **Device Information:**
+            - 🎯 Target Device: `${{ github.event.inputs.target_device }}`
+            - 📦 Source Device: `${{ github.event.inputs.source_device }}`
+            - 🔢 ROM Version: `${{ needs.setup-environment.outputs.rom_version }}`
+            - 🌍 ROM Type: `${{ github.event.inputs.rom_type }}`
+            - 📅 Build Date: `${{ github.event.repository.updated_at }}`
+            
+            ---
+            
+            ### ⚠️ Installation Instructions
+            
+            1. **Backup** your data (this will wipe everything)
+            2. Boot to custom recovery (TWRP/OrangeFox recommended)
+            3. **Wipe**: System, Data, Cache, Dalvik/ART Cache
+            4. Flash the ROM ZIP file
+            5. **(Optional)** Flash Magisk for root
+            6. Reboot and enjoy!
+            
+            ---
+            
+            ### ⚠️ Disclaimer
+            
+            This is an **automatically ported ROM**. While it uses proper porting techniques:
+            - Test thoroughly before daily use
+            - Some features may not work perfectly
+            - Flash at your own risk
+            - Always keep backups
+            
+            ---
+            
+            ### 📝 Checksums
+            
+            Verify file integrity before flashing. Check the `.sha256` and `.md5` files.
+            
+            ---
+            
+            ### 🐛 Known Issues
+            
+            - Report issues in the Issues tab
+            - Include detailed logs if possible
+            
+            ---
+            
+            **Built with:** [RomTools](https://github.com/Danda420/RomTools) + GitHub Actions
+          files: release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf release/
+          rm -rf ${{ env.WORKDIR }}
